@@ -1,6 +1,6 @@
 # dev-purge
 
-Find and clean build artifacts, dependency folders, and cache directories across all your projects. One command to reclaim gigabytes of disk space.
+Find and clean build artifacts, dependency folders, cache directories, and safe Docker leftovers across all your projects. One command to reclaim gigabytes of disk space.
 
 ## What it looks like
 
@@ -42,14 +42,17 @@ npx dev-purge
 ```bash
 dev-purge                         # Cycle through projects, y/n each
 dev-purge ~/projects              # Scan a specific directory
-dev-purge --dry-run               # Show bloat without deleting
-dev-purge -a                      # Single confirmation to delete all
+dev-purge --dry-run               # Show bloat + runtime artifacts without deleting
+dev-purge -a                      # Bulk-delete dirs, then optionally clean Docker leftovers
 dev-purge -a --older-than 1y      # Nuke everything older than a year
 dev-purge -a --category cache --older-than 6m  # Nuke old caches
 dev-purge --category deps         # Only node_modules, venv, Pods, etc.
+dev-purge --category containers   # Only exited Docker containers
+dev-purge --containers-only       # Runtime cleanup: exited containers only
+dev-purge --images-only           # Runtime cleanup: dangling images only
 dev-purge -s 100m                 # Only show bloat > 100 MB
 dev-purge -s 0                    # Show everything (no size minimum)
-dev-purge --json                  # Machine-readable JSON output
+dev-purge --json                  # Machine-readable JSON output (filesystem only)
 dev-purge --watch                 # Real-time disk usage monitoring
 dev-purge --ignore node_modules   # Exclude matching paths from the scan
 ```
@@ -64,14 +67,46 @@ Cycles through each project and asks y/n. Shows the project name, framework, blo
   Clean? (y/n)
 ```
 
+### Runtime cleanup (Docker)
+
+After the filesystem scan, `dev-purge` also inspects Docker for safe-to-remove leftovers:
+
+- exited containers (running containers are never touched)
+- dangling images (tagged images are never touched)
+
+```
+Runtime cleanup summary:
+  Exited containers found: 4
+  Candidates to remove: 4
+  Dangling images found: 2
+  Candidates to remove: 2
+```
+
+Focus only on runtime artifacts with category filters or the dedicated flags:
+
+```bash
+dev-purge --category containers   # exited containers only
+dev-purge --category images       # dangling images only
+dev-purge --containers-only       # containers only, skip the filesystem scan
+dev-purge --images-only           # images only, skip the filesystem scan
+```
+
+Notes:
+
+- Cleanup is best-effort and limited to safe defaults: exited containers and dangling images.
+- If Docker is not installed, not running, or inaccessible, `dev-purge` skips runtime cleanup and continues; the underlying Docker error is shown dimmed so it's debuggable.
+- `--older-than` is applied to runtime artifacts when a creation time is available. If Docker can't provide a parseable date, the artifact is **kept** (the safe choice) and a warning explains why.
+- `--containers-only` and `--images-only` are mutually exclusive.
+
 ### Delete all
 
-`dev-purge -a` shows the full table then asks once to delete everything. Combines with filters:
+`dev-purge -a` shows the full table, asks once to delete all directories, then asks separately about any Docker leftovers it found. Combines with filters:
 
 ```bash
 dev-purge -a --older-than 6m            # everything untouched for 6 months
 dev-purge -a --category cache           # all cache dirs, one confirmation
 dev-purge -a --category deps -s 100m    # large dependency dirs only
+dev-purge -a --category containers      # exited containers only
 ```
 
 ### JSON output
@@ -81,13 +116,15 @@ dev-purge --json | jq '.summary'
 dev-purge --json | jq '.projects[] | select(.totalBytes > 1000000000)'
 ```
 
+`--json` reports filesystem scan results only. Docker/runtime cleanup is interactive terminal output and is not included in the JSON payload (planned as a follow-up).
+
 ### Watch mode
 
 ```bash
 dev-purge --watch
 ```
 
-Refreshes every 5 seconds. Useful for monitoring disk usage during development.
+Refreshes every 5 seconds. Useful for monitoring disk usage during development. Like `--json`, watch mode covers filesystem results only.
 
 ### Ignoring folders
 
@@ -115,12 +152,14 @@ Invalid `ignore` entries in the config file (anything that isn't a non-empty str
 
 Filter by category with `--category`:
 
-| Category | Directories |
+| Category | Directories / artifacts |
 |---|---|
 | `deps` | node_modules, .pnpm-store, .yarn, vendor, bower_components, Pods, venv, .venv |
 | `build` | .next, .nuxt, .output, .svelte-kit, .angular, .expo, .vercel, dist, build, out, target, DerivedData |
 | `cache` | .cache, .parcel-cache, .turbo, .vite, \_\_pycache\_\_, .pytest_cache, .mypy_cache, .ruff_cache, .gradle, .dart_tool |
 | `test` | coverage, .nyc_output, storybook-static |
+| `containers` | exited Docker containers |
+| `images` | dangling Docker images |
 
 Multiple categories: `--category deps,build`
 
@@ -128,13 +167,15 @@ Multiple categories: `--category deps,build`
 
 ```
 --dry-run                Scan only, don't delete anything
--a, --all                Delete all found bloat with single confirmation
---older-than <dur>       Filter by project age (30d, 2w, 6m, 1y)
---category <cat>         Filter by category (comma-separated)
+-a, --all                Bulk-delete found directories, then optionally clean runtime artifacts
+--older-than <dur>       Filter by age (30d, 2w, 6m, 1y); also applied to Docker artifacts when dated
+--category <cat>         Filter by category (comma-separated): deps, build, cache, test, containers, images
 -s, --min-size <size>    Minimum size to show (default: 1m, use -s 0 for all)
 -d, --depth <n>          Max scan depth (default: 6)
 --ide                    Also scan IDE caches (.cursor, .vscode, .idea)
---json                   Output as JSON
+--containers-only        Runtime cleanup of exited containers only (no filesystem scan)
+--images-only            Runtime cleanup of dangling images only (no filesystem scan)
+--json                   Output filesystem results as JSON
 --watch                  Real-time monitoring
 --ignore <glob>          Ignore paths (absolute, relative to scan root, or bare dir name; repeatable)
 -h, --help               Show help
@@ -146,6 +187,7 @@ Multiple categories: `--category deps,build`
 - **Framework detection** — automatically identifies Next.js, React, Python, Rust, Go, and 20+ other frameworks by reading project files. Python is also inferred from `__pycache__`/`.venv` when no project marker exists.
 - **Safe scanning** — skips language runtimes (.pyenv, .nvm, .rustup, go/pkg), IDE internals, virtualenvs, and system directories. Won't flag `build`/`dist`/`vendor` unless the parent has a project marker file.
 - **Generic dir protection** — `build`, `dist`, `out`, `vendor`, `target`, and `coverage` are only flagged inside actual projects (determined by the presence of package.json, Cargo.toml, requirements.txt, etc.).
+- **Conservative Docker scope** — runtime cleanup only ever targets exited containers (`status=exited`) and dangling images (`dangling=true`); running containers and tagged images are never touched. Docker is invoked via `execFile` with an argv array (no shell), and calls time out after 15s so a stuck daemon won't hang a cron job.
 
 ## How it works
 
