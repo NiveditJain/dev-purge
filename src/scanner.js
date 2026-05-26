@@ -246,6 +246,9 @@ function compileIgnorePattern(rawPattern, rootPath) {
   if (!raw) return null;
 
   const expanded = expandHome(raw);
+  // A bare "~" can expand to "" in rare embedded envs with no HOME set; never
+  // turn that into an empty pattern that would match everything.
+  if (!expanded) return null;
   const hasSlash = /[\\/]/.test(expanded);
   const hasMagic = hasGlobMagic(expanded);
 

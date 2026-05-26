@@ -24,6 +24,43 @@ function hasFlag(...names) {
   return names.some((n) => args.includes(n));
 }
 
+// Boolean (no-value) flags and value-taking flags. Combined into KNOWN_FLAGS so
+// that value parsing can tell "the next token is this flag's value" apart from
+// "the next token is a different flag". A token that merely starts with "-" but
+// isn't a flag we recognize (e.g. a path literally named "-tmp", or the glob
+// "-cache/**") is treated as a value — this keeps getFlagValue and
+// getFlagValues consistent and stops them silently dropping such values.
+const BOOLEAN_FLAGS = [
+  "--dry-run",
+  "--all",
+  "-a",
+  "--watch",
+  "--help",
+  "-h",
+  "--json",
+  "--ide",
+];
+const flagsWithValues = new Set([
+  "--older-than",
+  "-d",
+  "--depth",
+  "-s",
+  "--min-size",
+  "--category",
+  "--ignore",
+]);
+const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...flagsWithValues]);
+
+function isKnownFlag(token) {
+  return KNOWN_FLAGS.has(token);
+}
+
+// True when `token` exists and isn't itself a recognized flag, i.e. it can be
+// consumed as the value of the preceding flag.
+function isValueToken(token) {
+  return token !== undefined && !isKnownFlag(token);
+}
+
 function getFlagValue(name) {
   // --foo=bar
   for (const arg of args) {
@@ -31,7 +68,7 @@ function getFlagValue(name) {
   }
   // --foo bar
   const idx = args.indexOf(name);
-  if (idx !== -1 && args[idx + 1] && !args[idx + 1].startsWith("-")) {
+  if (idx !== -1 && isValueToken(args[idx + 1])) {
     return args[idx + 1];
   }
   return null;
@@ -42,7 +79,7 @@ function getFlagValues(name) {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === name) {
-      if (args[i + 1] && !args[i + 1].startsWith("-")) {
+      if (isValueToken(args[i + 1])) {
         values.push(args[i + 1]);
         i++;
       }
@@ -54,24 +91,10 @@ function getFlagValues(name) {
 }
 
 // Positional args (not flags and not flag values)
-const flagsWithValues = new Set([
-  "--older-than",
-  "-d",
-  "--depth",
-  "-s",
-  "--min-size",
-  "--category",
-  "--ignore",
-]);
 const positional = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i].startsWith("-")) {
-    if (
-      flagsWithValues.has(args[i]) &&
-      args[i + 1] &&
-      !args[i + 1].startsWith("-")
-    )
-      i++; // skip value
+    if (flagsWithValues.has(args[i]) && isValueToken(args[i + 1])) i++; // skip value
     continue;
   }
   // skip if previous arg was a flag expecting a value
@@ -98,24 +121,45 @@ const minSize = minSizeRaw !== null ? parseSize(minSizeRaw) : 1024 * 1024; // de
 const categoryRaw = getFlagValue("--category");
 const categories = categoryRaw ? new Set(categoryRaw.split(",")) : null;
 
-// Load config file for default ignore patterns
-let configIgnore = [];
-const configHome = process.env.XDG_CONFIG_HOME || resolve(process.env.HOME || homedir(), ".config");
-const cfgPath = resolve(configHome, "dev-purge", "config.json");
-try {
-  const raw = await readFile(cfgPath, "utf-8");
-  const cfg = JSON.parse(raw);
-  if (Array.isArray(cfg.ignore)) configIgnore = cfg.ignore;
-} catch {
-  // no config or unreadable - ignore
-}
-
-// CLI-provided ignore patterns (repeatable)
-const cliIgnore = getFlagValues("--ignore") || [];
-// Merge config + CLI (CLI entries appended, user can override by specifying patterns)
-const ignorePatterns = [...new Set([...(configIgnore || []), ...cliIgnore])];
-
 const rootPath = resolve(positional[0] || ".");
+
+// Resolve ignore patterns from the config file (defaults) merged with CLI
+// `--ignore` flags. Deferred to call time rather than top-level: reading the
+// config eagerly would run before the `--help` short-circuit, so a slow or hung
+// $XDG_CONFIG_HOME mount could hang `dev-purge --help`.
+async function loadIgnorePatterns() {
+  const configHome =
+    process.env.XDG_CONFIG_HOME ||
+    resolve(process.env.HOME || homedir(), ".config");
+  const cfgPath = resolve(configHome, "dev-purge", "config.json");
+
+  const configIgnore = [];
+  try {
+    const raw = await readFile(cfgPath, "utf-8");
+    const cfg = JSON.parse(raw);
+    if (Array.isArray(cfg.ignore)) {
+      for (const entry of cfg.ignore) {
+        if (typeof entry === "string" && entry.trim()) {
+          configIgnore.push(entry);
+        } else {
+          // Predictability matters for cron-driven runs: surface bad entries
+          // instead of silently dropping them.
+          console.warn(
+            chalk.yellow(
+              `  Ignoring invalid "ignore" entry in ${cfgPath}: ${JSON.stringify(entry)}`,
+            ),
+          );
+        }
+      }
+    }
+  } catch {
+    // no config or unreadable — fall back to CLI-only ignore patterns
+  }
+
+  // CLI-provided patterns (repeatable), appended after config defaults.
+  const cliIgnore = getFlagValues("--ignore");
+  return [...new Set([...configIgnore, ...cliIgnore])];
+}
 
 // ── Main ────────────────────────────────────────────────────────────
 if (help) {
@@ -130,6 +174,10 @@ if (watch) {
 }
 
 async function run() {
+  // Resolve ignore patterns before the spinner starts so any config warnings
+  // print cleanly instead of being overwritten by the spinner.
+  const ignorePatterns = await loadIgnorePatterns();
+
   const spinner = json
     ? {
         start() {
@@ -244,6 +292,8 @@ async function deleteItems(items) {
 
 async function runWatch() {
   printWatchHeader();
+
+  const ignorePatterns = await loadIgnorePatterns();
 
   const update = async () => {
     const results = await scan(rootPath, {

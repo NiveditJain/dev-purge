@@ -107,7 +107,9 @@ You can also define defaults in `~/.config/dev-purge/config.json`:
 }
 ```
 
-Ignore patterns support absolute paths, paths relative to the scan root, bare directory names, `~`, `*`, `?`, and `**`. The same ignore rules apply in watch mode.
+Ignore patterns support absolute paths, paths relative to the scan root, bare directory names, `~`, `*`, `?`, and `**`. The same ignore rules apply in watch mode. Matching is case-sensitive, so `node_modules` does not match `Node_Modules` (worth noting on case-insensitive filesystems such as macOS HFS+/APFS).
+
+Invalid `ignore` entries in the config file (anything that isn't a non-empty string) are skipped with a warning rather than silently dropped.
 
 ## Categories
 
